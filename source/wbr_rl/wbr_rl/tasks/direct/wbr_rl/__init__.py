@@ -13,7 +13,7 @@ from . import agents
 
 
 gym.register(
-    id="Template-Wbr-Rl-Direct-v0",
+    id="Wbr-Rl-Direct-v0",
     entry_point=f"{__name__}.wbr_rl_env:WbrRlEnv",
     disable_env_checker=True,
     kwargs={
