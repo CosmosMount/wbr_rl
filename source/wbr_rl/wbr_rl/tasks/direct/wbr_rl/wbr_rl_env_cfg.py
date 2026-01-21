@@ -58,9 +58,11 @@ class WbrRlEnvCfg(DirectRLEnvCfg):
     ]
 
     # Reward parameters - only for pitch stabilization
-    pitch_reward_scale: float = 1.0
+    alpha_reward_scale: float = 1.2
+    pitch_reward_scale: float = 2.0
     actions_cost_scale: float = 0.01
-    dof_vel_scale: float = 0.1
+    dof_vel_scale: float = 0.05
+    alpha_dot_scale: float = 0.05
     
     death_cost: float = -1.0
     termination_height: float = 0.1

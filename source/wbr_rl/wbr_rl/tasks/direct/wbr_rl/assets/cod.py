@@ -19,7 +19,7 @@ _current_dir = os.path.dirname(os.path.realpath(__file__))
 
 COD_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=os.path.join(_current_dir, "Robot.usd"),
+        usd_path=os.path.join(_current_dir, "COD-2026RoboMaster-Balance.usd"),
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
