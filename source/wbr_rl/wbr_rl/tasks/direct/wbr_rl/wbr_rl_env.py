@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
@@ -7,36 +7,16 @@ from __future__ import annotations
 
 import math
 import torch
-import numpy as np
 import isaacsim.core.utils.torch as torch_utils
-from isaacsim.core.utils.torch.rotations import compute_rot, quat_conjugate
+from isaacsim.core.utils.torch.rotations import compute_rot, quat_conjugate, quat_rotate_inverse
 from collections.abc import Sequence
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
-from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import sample_uniform
 
 from .wbr_rl_env_cfg import WbrRlEnvCfg
-from .vmc import vmcsolver
-
-def quat_to_euler(quat: torch.Tensor) -> torch.Tensor:
-    w, x, y, z = quat.unbind(-1)
-
-    t0 = 2.0 * (w * x + y * z)
-    t1 = 1.0 - 2.0 * (x * x + y * y)
-    roll = torch.atan2(t0, t1)
-
-    t2 = 2.0 * (w * y - z * x)
-    t2 = torch.clamp(t2, -1.0, 1.0)
-    pitch = torch.asin(t2)
-
-    t3 = 2.0 * (w * z + x * y)
-    t4 = 1.0 - 2.0 * (y * y + z * z)
-    yaw = torch.atan2(t3, t4)
-
-    return torch.stack((roll, pitch, yaw), dim=-1)
 
 class WbrRlEnv(DirectRLEnv):
     cfg: WbrRlEnvCfg
@@ -47,44 +27,76 @@ class WbrRlEnv(DirectRLEnv):
         self.action_scale = self.cfg.action_scale
         self.joint_gears = torch.tensor(self.cfg.joint_gears, dtype=torch.float32, device=self.sim.device)
         
-        # Find only the actuated joints defined in the configuration
-        self.rjoint4_idx, _ = self.robot.find_joints("Left_front_joint")
-        self.rjoint1_idx, _ = self.robot.find_joints("Left_rear_joint")
-        self.ljoint4_idx, _ = self.robot.find_joints("Right_front_joint")
-        self.ljoint1_idx, _ = self.robot.find_joints("Right_rear_joint")
-        self.rwheel_idx, _ = self.robot.find_joints("Left_Wheel_joint")
-        self.lwheel_idx, _ = self.robot.find_joints("Right_Wheel_joint")
-        joint_names = [
-            "Left_front_joint", "Left_rear_joint", "Right_front_joint", 
-            "Right_rear_joint", "Left_Wheel_joint", "Right_Wheel_joint"
-        ]
-        self._joint_dof_idx = []
-        for joint_name in joint_names:
-            idx, _ = self.robot.find_joints(joint_name)
-            self._joint_dof_idx.append(idx[0])
-        self._joint_dof_idx = torch.tensor(self._joint_dof_idx, dtype=torch.long, device=self.sim.device)
+        # ----------------------------------------------------------------------
+        # 1. Joint & Body Indexing
+        # ----------------------------------------------------------------------
+        self.wheel_joint_names = ["Left_Wheel_joint", "Right_Wheel_joint"]
+        self.leg_joint_names = ["Left_front_joint", "Left_rear_joint", "Right_front_joint", "Right_rear_joint"]
         
-        # Initialize rotation tracking
-        self.start_rotation = torch.tensor([1, 0, 0, 0], device=self.sim.device, dtype=torch.float32)
-        self.inv_start_rot = quat_conjugate(self.start_rotation).repeat((self.num_envs, 1))
+        # Get Global Robot DOF Indices (returns python list[int])
+        wheel_indices_list, _ = self.robot.find_joints(self.wheel_joint_names)
+        leg_indices_list, _ = self.robot.find_joints(self.leg_joint_names)
+        
+        # Convert to Tensors for torch operations
+        self.wheel_dof_indices = torch.tensor(wheel_indices_list, device=self.device)
+        self.leg_dof_indices = torch.tensor(leg_indices_list, device=self.device)
+        
+        # Combined indices for mapping Actions -> Robot Joints
+        self._joint_dof_idx = torch.cat((self.leg_dof_indices, self.wheel_dof_indices))
 
-        # Initialize vmc solver
-        self.lsolver = [vmcsolver() for _ in range(self.num_envs)]
-        self.rsolver = [vmcsolver() for _ in range(self.num_envs)]
+        # === Action Vector Indices ===
+        # Since we concatenated (Legs, Wheels) in _joint_dof_idx, the action vector 
+        # follows the same order: [Leg1, Leg2, Leg3, Leg4, Wheel1, Wheel2]
+        num_legs = len(self.leg_dof_indices)
+        num_wheels = len(self.wheel_dof_indices)
+        
+        # Indices to slice the 'self.actions' tensor
+        self.leg_action_indices = torch.arange(num_legs, device=self.device)
+        self.wheel_action_indices = torch.arange(num_wheels, device=self.device) + num_legs
+        
+        # Find indices for Feet/Wheels bodies (using correct case "link")
+        self.left_foot_body_idx, _ = self.robot.find_bodies("Left_Wheel_link") 
+        self.right_foot_body_idx, _ = self.robot.find_bodies("Right_Wheel_link")
+        
+        # ----------------------------------------------------------------------
+        # 2. Buffers for History & Commands
+        # ----------------------------------------------------------------------
+        # Commands: [v_x, v_y, omega_z, target_height]
+        self.commands = torch.zeros(self.num_envs, 4, device=self.device)
+        self.command_timer = torch.zeros(self.num_envs, device=self.device)
+        
+        # History buffers
+        # FIX: last_actions must match the size of self.actions (actuated joints only), NOT joint_pos
+        self.last_actions = torch.zeros(self.num_envs, len(self._joint_dof_idx), device=self.device)
+        
+        # last_dof_vel matches full robot joint state (for calculating accelerations)
+        self.last_dof_vel = torch.zeros_like(self.robot.data.joint_vel)
+        
+        self.base_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        self.base_ang_vel = torch.zeros(self.num_envs, 3, device=self.device)
+        self.projected_gravity = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # Link state buffers
+        self.left_foot_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        self.right_foot_pos = torch.zeros(self.num_envs, 3, device=self.device)
 
-        self.roll = torch.zeros(self.num_envs, device=self.sim.device, dtype=torch.float32)
-        self.pitch = torch.zeros(self.num_envs, device=self.sim.device, dtype=torch.float32)
-        self.yaw = torch.zeros(self.num_envs, device=self.sim.device, dtype=torch.float32)
-        self.gyro_r = torch.zeros(self.num_envs, device=self.sim.device, dtype=torch.float32)
-        self.gyro_p = torch.zeros(self.num_envs, device=self.sim.device, dtype=torch.float32)
-        self.gyro_y = torch.zeros(self.num_envs, device=self.sim.device, dtype=torch.float32)
-        self.vmc_state = torch.zeros((self.num_envs, 4), device=self.sim.device, dtype=torch.float32)
-
-        self.dof_pos = self.robot.data.joint_pos
-        self.dof_vel = self.robot.data.joint_vel
+        # ----------------------------------------------------------------------
+        # 3. Config Parsing
+        # ----------------------------------------------------------------------
+        self.reward_cfg = getattr(self.cfg, "reward_params", {
+            "tracking_linx_sigma": 0.25,
+            "tracking_liny_sigma": 0.25,
+            "tracking_ang_sigma": 0.25,
+            "tracking_height_sigma": 0.1,
+            "feet_distance": [0.2, 0.5], # [min, max]
+            "tracking_gravity_sigma": 0.1
+        })
+        self.command_cfg = getattr(self.cfg, "command_params", {
+            "zero_stable": True,
+            "resampling_time": 4.0
+        })
 
     def _setup_scene(self):
-
         self.robot = Articulation(self.cfg.robot)
         # add ground plane
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
@@ -92,10 +104,9 @@ class WbrRlEnv(DirectRLEnv):
         self.terrain = self.cfg.terrain.class_type(self.cfg.terrain)
         # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
-        # we need to explicitly filter collisions for CPU simulation
+        # filter collisions
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
-        # add articulation to scene
         self.scene.articulations["robot"] = self.robot
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -103,105 +114,125 @@ class WbrRlEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor):
         self.actions = actions.clone()
+        # Resample commands if needed
+        self._resample_commands()
 
     def _apply_action(self):
+        # Store history before step
+        self.last_dof_vel[:] = self.robot.data.joint_vel[:]
+        self.last_actions[:] = self.actions[:]
+        
+        # Apply Torques
         forces = self.action_scale * self.joint_gears * self.actions
         self.robot.set_joint_effort_target(forces, joint_ids=self._joint_dof_idx)
 
-    def _get_observations(self) -> dict: 
-        # Get robot state
-        quat_copy = self.robot.data.root_quat_w  # 世界坐标系四元数
-        rpy = quat_to_euler(quat_copy)
-        # 角速度 (3) - 相当于陀螺仪
-        ang_vel = self.robot.data.root_ang_vel_b  # body frame角速度
+    def _resample_commands(self):
+        """Randomly sample velocity and height commands."""
+        dt = self.cfg.sim.dt * self.cfg.decimation
+        self.command_timer += dt
         
-        # 保存RPY和角速度供reward函数使用
-        self.roll = rpy[:, 0]      # [num_envs]
-        self.pitch = rpy[:, 1]     # [num_envs]
-        self.yaw = rpy[:, 2]       # [num_envs]
-        self.gyro_r = ang_vel[:, 0]  # [num_envs]
-        self.gyro_p = ang_vel[:, 1]  # [num_envs]
-        self.gyro_y = ang_vel[:, 2]  # [num_envs]
-
-        # print ("Pitch angles:", self.pitch)
-
-        vmc_data = []
-
-        if torch.all(self.dof_pos == 0):
-            print("Warning: Observation called before environment reset. Returning zero observations.")
-            self.vmc_state = torch.zeros((self.num_envs, 4), device=self.device)  
-        else:
-            # VMC kinematics
-            for i in range(self.num_envs):
-                ljoint1_pos = self.dof_pos[i, self.ljoint1_idx].item()
-                ljoint4_pos = self.dof_pos[i, self.ljoint4_idx].item()
-                rjoint1_pos = self.dof_pos[i, self.rjoint1_idx].item()
-                rjoint4_pos = self.dof_pos[i, self.rjoint4_idx].item()
-
-                ljoint1_vel = self.dof_vel[i, self.ljoint1_idx].item()
-                ljoint4_vel = self.dof_vel[i, self.ljoint4_idx].item()
-                rjoint1_vel = self.dof_vel[i, self.rjoint1_idx].item()
-                rjoint4_vel = self.dof_vel[i, self.rjoint4_idx].item()
-                
-                self.lsolver[i].Resolve(math.pi+ljoint1_pos, -ljoint4_pos)
-                self.rsolver[i].Resolve(math.pi-rjoint1_pos,  rjoint4_pos)
-
-                lleg_dot, lphi_dot = self.lsolver[i].VMCVelCal(np.array([ljoint1_vel, -ljoint4_vel]))
-                rleg_dot, rphi_dot = self.rsolver[i].VMCVelCal(np.array([rjoint1_vel, -rjoint4_vel]))
-
-                lphi = self.lsolver[i].GetPendulumRadian()
-                rphi = self.rsolver[i].GetPendulumRadian()
-                llen = self.lsolver[i].GetPendulumLen()
-                rlen = self.rsolver[i].GetPendulumLen()
-
-                lalpha = lphi-0.5*math.pi+self.pitch[i].item()
-                ralpha = rphi-0.5*math.pi+self.pitch[i].item()
-
-                lalpha_dot = lphi_dot + self.gyro_p[i].item()
-                ralpha_dot = rphi_dot + self.gyro_p[i].item()
-
-                vmc_data.append([lalpha, ralpha, lalpha_dot, ralpha_dot])
+        # Mask for envs that need new commands
+        resample_mask = self.command_timer >= self.command_cfg["resampling_time"]
+        resample_ids = resample_mask.nonzero(as_tuple=False).flatten()
+        
+        if len(resample_ids) > 0:
+            # Vx (Forward)
+            self.commands[resample_ids, 0] = sample_uniform(-1.0, 1.0, (len(resample_ids),), device=self.device)
+            # Vy (Lateral)
+            self.commands[resample_ids, 1] = sample_uniform(-0.5, 0.5, (len(resample_ids),), device=self.device)
+            # Omega Z (Yaw)
+            self.commands[resample_ids, 2] = sample_uniform(-1.5, 1.5, (len(resample_ids),), device=self.device)
+            # Height (Z) - Adjust range based on your robot size
+            self.commands[resample_ids, 3] = sample_uniform(0.1, 0.4, (len(resample_ids),), device=self.device)
             
-            self.vmc_state = torch.tensor(vmc_data, device=self.device, dtype=torch.float32)
+            if self.command_cfg["zero_stable"]:
+                zero_mask = torch.rand(len(resample_ids), device=self.device) < 0.2
+                self.commands[resample_ids[zero_mask], :3] = 0.0
 
-        # Simplified observation: pitch, pitch_velocity, joint positions, joint velocities
+            self.command_timer[resample_ids] = 0.0
+
+    def _get_observations(self) -> dict: 
+        # 1. Base State
+        root_quat = self.robot.data.root_quat_w
+        root_lin_vel_w = self.robot.data.root_lin_vel_w
+        root_ang_vel_w = self.robot.data.root_ang_vel_w
+        
+        # Convert World Velocity to Body Frame
+        self.base_lin_vel = quat_rotate_inverse(root_quat, root_lin_vel_w)
+        self.base_ang_vel = quat_rotate_inverse(root_quat, root_ang_vel_w)
+        
+        # Projected Gravity (Global [0,0,-1] in Body Frame)
+        gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=self.device).repeat(self.num_envs, 1)
+        self.projected_gravity = quat_rotate_inverse(root_quat, gravity_vec)
+
+        # 2. Joint State
+        self.dof_pos = self.robot.data.joint_pos
+        self.dof_vel = self.robot.data.joint_vel
+        
+        # 3. Feet Positions (for rewards)
+        if len(self.left_foot_body_idx) > 0:
+             self.left_foot_pos = self.robot.data.body_pos_w[:, self.left_foot_body_idx[0], :]
+             self.right_foot_pos = self.robot.data.body_pos_w[:, self.right_foot_body_idx[0], :]
+
+        # 4. Construct Observation Vector
         obs = torch.cat(
             (
-                self.pitch.unsqueeze(-1),  # pitch angle
-                self.gyro_p.unsqueeze(-1),  # pitch angular velocity (y-axis)
-                self.dof_pos,  # 6 joint positions
-                self.dof_vel * self.cfg.dof_vel_scale,  # 6 joint velocities
-                self.vmc_state # VMC data: lalpha, ralpha, lalpha_dot, ralpha_dot
+                self.base_lin_vel * 2.0,      # Scale for network stability
+                self.base_ang_vel * 0.25,
+                self.projected_gravity,
+                self.commands * 2.0,          # [vx, vy, wz, h]
+                (self.dof_pos - self.robot.data.default_joint_pos) * 1.0,
+                self.dof_vel * 0.05,
+                self.actions                  # Last actions
             ),
             dim=-1,
         )
-        observations = {"policy": obs}
-        return observations
+        
+        return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
+        # 1. Tracking
+        rew_lin_x = self._reward_tracking_lin_x_vel()
+        rew_lin_y = self._reward_tracking_lin_y_vel()
+        rew_ang_z = self._reward_tracking_ang_vel()
+        rew_height = self._reward_tracking_leg_length()
+        
+        # 2. Stability / Penalties
+        rew_lin_z = self._reward_lin_vel_z()
+        rew_ang_xy = self._reward_ang_vel_xy()
+        rew_projected_gravity = self._reward_projected_gravity()
+        
+        # 3. Action / Smoothness
+        rew_joint_acc = self._reward_joint_action_rate() 
+        rew_wheel_acc = self._reward_reward_wheel_action_rate()
+        rew_dof_acc = self._reward_dof_acc()
+        rew_dof_vel = self._reward_joint_vel()
+        
+        # 4. Constraints
+        rew_collision = self._reward_collision()
+        rew_feet_dist = self._reward_feet_distance()
+        rew_calf_sym = self._reward_similar_calf()
 
-        lalpha = self.vmc_state[:, 0]
-        ralpha = self.vmc_state[:, 1]
-        lalpha_dot = self.vmc_state[:, 2]
-        ralpha_dot = self.vmc_state[:, 3]
-
-        lalpha_reward = torch.exp(-torch.abs(lalpha)*5.0) * self.cfg.alpha_reward_scale
-        ralpha_reward = torch.exp(-torch.abs(ralpha)*5.0) * self.cfg.alpha_reward_scale
-        # lalpha_dot_penalty = torch.exp(-torch.abs(lalpha_dot) * 0.1) * self.cfg.alpha_dot_scale
-        # ralpha_dot_penalty = torch.exp(-torch.abs(ralpha_dot) * 0.1) * self.cfg.alpha_dot_scale
+        # Summation (You should fine-tune these weights in config)
+        total_reward = (
+            rew_lin_x * 1.0 +
+            rew_lin_y * 1.0 + 
+            rew_ang_z * 0.5 + 
+            rew_height * 1.0 +
+            # Penalties (Subtracted)
+            rew_projected_gravity * -1.0 +
+            rew_lin_z * -2.0 +
+            rew_ang_xy * -0.05 +
+            rew_joint_acc * -0.01 +
+            rew_wheel_acc * -0.01 +
+            rew_dof_acc * -2.5e-7 + 
+            rew_dof_vel * -0.001 +
+            rew_collision * -1.0 +
+            rew_calf_sym * -1.0 +
+            rew_feet_dist
+        )
         
-        # Reward for keeping pitch close to 0
-        pitch_reward = torch.exp(-torch.abs(self.pitch)*20.0) * self.cfg.pitch_reward_scale
-        
-        # Penalty for large actions
-        actions_cost = torch.sum(self.actions**2, dim=-1) * self.cfg.actions_cost_scale
-        
-        # print ("obs:", lalpha.mean().item(), ralpha.mean().item(), lalpha_dot.mean().item(), ralpha_dot.mean().item())
-        # print ("reward components:", pitch_reward.mean().item(), lalpha_reward.mean().item(), ralpha_reward.mean().item(), actions_cost.mean().item())
-        # print ("penalty components:", lalpha_dot_penalty.mean().item(), ralpha_dot_penalty.mean().item())
-        total_reward = pitch_reward+lalpha_reward+ralpha_reward-actions_cost #-lalpha_dot_penalty-ralpha_dot_penalty
-        
-        # Apply death cost for terminated agents
+        # Apply death cost
         total_reward = torch.where(
             self.reset_terminated, 
             torch.ones_like(total_reward) * self.cfg.death_cost, 
@@ -209,6 +240,90 @@ class WbrRlEnv(DirectRLEnv):
         )
         
         return total_reward
+
+    # ------------ Custom Reward Implementations ----------------
+
+    def _reward_tracking_lin_x_vel(self):
+        lin_vel_error = torch.square(self.commands[:, 0] - self.base_lin_vel[:, 0])
+        lin_vel_reward = torch.exp(-lin_vel_error / self.reward_cfg["tracking_linx_sigma"])
+        if self.command_cfg["zero_stable"]:
+            near_zero_mask = (torch.abs(self.commands[:, 0]) <= 0.01)
+            if torch.any(near_zero_mask):
+                second_error = torch.square(self.base_lin_vel[near_zero_mask, 0])
+                second_reward = torch.exp(-second_error / self.reward_cfg["tracking_linx_sigma"])
+                lin_vel_reward[near_zero_mask] += second_reward
+        return lin_vel_reward
+
+    def _reward_tracking_lin_y_vel(self):
+        lin_vel_error = torch.square(self.commands[:, 1] - self.base_lin_vel[:, 1])
+        return torch.exp(-lin_vel_error / self.reward_cfg["tracking_liny_sigma"])
+
+    def _reward_tracking_ang_vel(self):
+        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+        ang_vel_reward = torch.exp(-ang_vel_error / self.reward_cfg["tracking_ang_sigma"])
+        return ang_vel_reward
+
+    def _reward_tracking_leg_length(self):
+        # Uses leg joint indices (Indices relative to full robot state)
+        # Note: adjust index offset [1]/[3] if your 'Left_rear_joint' etc order is different
+        knee_error = torch.square(self.dof_pos[:, self.leg_dof_indices[1]] - self.commands[:, 3])
+        knee_error += torch.square(self.dof_pos[:, self.leg_dof_indices[3]] - self.commands[:, 3])
+        return torch.exp(-knee_error / self.reward_cfg["tracking_height_sigma"])
+
+    def _reward_lin_vel_z(self):
+        return torch.square(self.base_lin_vel[:, 2])
+    
+    def _reward_joint_action_rate(self):
+        # FIX: Use 'leg_action_indices' to slice 'actions' (size 6)
+        # NOT 'leg_dof_indices' which are global joint indices (e.g. 5,6,7,8)
+        joint_action_rate = self.last_actions[:, self.leg_action_indices] - self.actions[:, self.leg_action_indices]
+        return torch.sum(torch.square(joint_action_rate), dim=1)
+
+    def _reward_reward_wheel_action_rate(self):
+        # FIX: Use 'wheel_action_indices'
+        wheel_action_rate = self.last_actions[:, self.wheel_action_indices] - self.actions[:, self.wheel_action_indices]
+        return torch.sum(torch.square(wheel_action_rate), dim=1)
+
+    def _reward_projected_gravity(self):
+        reward = torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
+        return reward
+    
+    def _reward_similar_calf(self):
+        # Uses global joint positions, so 'leg_dof_indices' is correct here
+        rew = torch.square(self.dof_pos[:, self.leg_dof_indices[0]] - self.dof_pos[:, self.leg_dof_indices[2]])
+        return rew
+
+    def _reward_joint_vel(self):
+        # Uses global joint velocities, so 'leg_dof_indices' is correct here
+        return torch.sum(torch.square(self.dof_vel[:, self.leg_dof_indices]), dim=1)
+
+    def _reward_dof_acc(self):
+        dt = self.cfg.sim.dt * self.cfg.decimation
+        dof_acc = (self.dof_vel - self.last_dof_vel) / dt
+        return torch.sum(torch.square(dof_acc), dim=1)
+
+    def _reward_ang_vel_xy(self):
+        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
+
+    def _reward_collision(self):
+        data = self.scene.articulations["robot"].data
+        # 向后兼容 IsaacLab 各版本的接触力字段
+        contact_forces = getattr(data, "net_contact_forces", None)
+        if contact_forces is None:
+            contact_forces = getattr(data, "contact_forces", None)
+        if contact_forces is None:
+            return torch.zeros(self.num_envs, device=self.device)
+        force_norm = torch.norm(contact_forces, dim=-1)
+        return torch.sum(force_norm.square(), dim=1)
+    
+    def _reward_feet_distance(self):
+        feet_distance = torch.norm(self.left_foot_pos - self.right_foot_pos, dim=-1)
+        reward = torch.clamp(self.reward_cfg["feet_distance"][0] - feet_distance, min=0.0, max=1.0) + \
+                 torch.clamp(feet_distance - self.reward_cfg["feet_distance"][1], min=0.0, max=1.0)
+        return reward
+    
+    def _reward_survive(self):
+        return torch.ones(self.num_envs, dtype=torch.float, device=self.device)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -229,3 +344,12 @@ class WbrRlEnv(DirectRLEnv):
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+        
+        # Reset buffers
+        self.last_actions[env_ids] = 0.0
+        self.last_dof_vel[env_ids] = 0.0
+        self.command_timer[env_ids] = 0.0
+        self.commands[env_ids, 0] = sample_uniform(-1.0, 1.0, (len(env_ids),), device=self.device)
+        self.commands[env_ids, 1] = sample_uniform(-0.5, 0.5, (len(env_ids),), device=self.device)
+        self.commands[env_ids, 2] = sample_uniform(-1.0, 1.0, (len(env_ids),), device=self.device)
+        self.commands[env_ids, 3] = sample_uniform(0.1, 0.4, (len(env_ids),), device=self.device)
