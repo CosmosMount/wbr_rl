@@ -182,7 +182,7 @@ class WbrRlEnv(DirectRLEnv):
                 self.projected_gravity,
                 self.commands * 2.0,          # [vx, vy, wz, h]
                 (self.dof_pos - self.robot.data.default_joint_pos) * 1.0,
-                self.dof_vel * 0.05,
+                torch.clamp(self.dof_vel * 0.05, -5.0, 5.0),  # Clamp to prevent explosion
                 self.actions                  # Last actions
             ),
             dim=-1,
@@ -213,23 +213,23 @@ class WbrRlEnv(DirectRLEnv):
         rew_feet_dist = self._reward_feet_distance()
         rew_calf_sym = self._reward_similar_calf()
 
-        # Summation (You should fine-tune these weights in config)
+        # Summation (Rewards rescaled to keep total per-step reward around -1 to +1)
         total_reward = (
-            rew_lin_x * 1.0 +
-            rew_lin_y * 1.0 + 
-            rew_ang_z * 0.5 + 
-            rew_height * 1.0 +
+            rew_lin_x * 0.15 +
+            rew_lin_y * 0.10 + 
+            rew_ang_z * 0.08 + 
+            rew_height * 0.12 +
             # Penalties (Subtracted)
-            rew_projected_gravity * -1.0 +
-            rew_lin_z * -2.0 +
+            rew_projected_gravity * -0.15 +
+            rew_lin_z * -0.25 +
             rew_ang_xy * -0.05 +
-            rew_joint_acc * -0.01 +
-            rew_wheel_acc * -0.01 +
-            rew_dof_acc * -2.5e-7 + 
-            rew_dof_vel * -0.001 +
-            rew_collision * -1.0 +
-            rew_calf_sym * -1.0 +
-            rew_feet_dist
+            rew_joint_acc * -0.005 +
+            rew_wheel_acc * -0.005 +
+            rew_dof_acc * -1.0e-7 + 
+            rew_dof_vel * -0.0005 +
+            rew_collision * -0.1 +
+            rew_calf_sym * -0.08 +
+            rew_feet_dist * -0.1
         )
         
         # Apply death cost
@@ -300,6 +300,8 @@ class WbrRlEnv(DirectRLEnv):
     def _reward_dof_acc(self):
         dt = self.cfg.sim.dt * self.cfg.decimation
         dof_acc = (self.dof_vel - self.last_dof_vel) / dt
+        # Clamp acceleration to prevent explosion
+        dof_acc = torch.clamp(dof_acc, -100.0, 100.0)
         return torch.sum(torch.square(dof_acc), dim=1)
 
     def _reward_ang_vel_xy(self):
@@ -314,6 +316,8 @@ class WbrRlEnv(DirectRLEnv):
         if contact_forces is None:
             return torch.zeros(self.num_envs, device=self.device)
         force_norm = torch.norm(contact_forces, dim=-1)
+        # Clamp force to prevent explosion
+        force_norm = torch.clamp(force_norm, 0.0, 1000.0)
         return torch.sum(force_norm.square(), dim=1)
     
     def _reward_feet_distance(self):

@@ -22,7 +22,7 @@ class WbrRlEnvCfg(DirectRLEnvCfg):
     decimation = 2
     action_scale = 1.0
     action_space = 6  # 6 joints
-    observation_space = 14  # Simplified observation: pitch, pitch_vel, 6 dof_pos, 6 dof_vel
+    observation_space = 31  # base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + commands(4) + dof_pos(6) + dof_vel(6) + actions(6)
     state_space = 0
 
     # simulation
